@@ -72,6 +72,17 @@
           </p>
         </div>
 
+        <!-- Outbound egress warning banner: outbound traffic is NOT tunneled (fail-open gap) -->
+        <div id="egress-warning-banner" class="info-box" style="display: none; grid-column: span 3; background: rgba(255, 80, 80, 0.15); border: 1px solid rgba(255, 80, 80, 0.5); border-radius: 12px; padding: 1rem 1.25rem; margin-bottom: 1.5rem; color: #ff7b72; font-size: 0.9rem;">
+          <div style="display: flex; align-items: center; gap: 0.75rem; font-weight: 600;">
+            <svg style="width: 20px; height: 20px; fill: currentColor; flex-shrink: 0;" viewBox="0 0 24 24"><path d="M12 2L1 21h22L12 2zm1 14h-2v-2h2v2zm0-4h-2V10h2v2z"/></svg>
+            <span>Outbound Traffic Not Tunneled</span>
+          </div>
+          <p style="margin: 0.5rem 0 0 0; opacity: 0.9; line-height: 1.4;">
+            This node's outbound traffic is <strong>NOT</strong> routed through the TunnelSats VPN. The host-managed gateway is fail-open. Verify that the tunneling gateway is enabled in <strong>⚙ → Configure</strong> / <strong>System &gt; Gateways</strong>.
+          </p>
+        </div>
+
         <!-- Connection Details Card -->
         <section class="card glass-card span-2 properties-card">
           <h2>Connection Properties</h2>

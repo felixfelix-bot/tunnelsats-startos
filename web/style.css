@@ -129,6 +129,13 @@ body {
   border-color: rgba(239, 68, 68, 0.25);
 }
 
+.status-badge.warning {
+  background: rgba(250, 204, 21, 0.12);
+  color: var(--accent-bitcoin);
+  box-shadow: 0 0 12px var(--accent-bitcoin-glow);
+  border-color: rgba(250, 204, 21, 0.4);
+}
+
 .pulse-dot {
   width: 8px;
   height: 8px;
