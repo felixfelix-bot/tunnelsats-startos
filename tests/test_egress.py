@@ -233,6 +233,50 @@ class TestExpectedTunnelIp(unittest.TestCase):
         self.assertEqual(result["raw_host"], None)
         self.assertEqual(result["resolved_ip"], None)
 
+    @patch('os.path.exists', return_value=True)
+    @patch('builtins.open')
+    def test_get_expected_tunnel_ip_parses_bracketed_ipv6_endpoint(
+        self, mock_open, mock_exists
+    ):
+        # A bracketed IPv6 literal Endpoint must unwrap cleanly, never yield a
+        # malformed capture ('[2001' from a naive colon-stopping regex).
+        conf = "[Interface]\n[Peer]\nEndpoint = [2001:db8::1]:51820\n"
+        mock_open.return_value = unittest.mock.mock_open(read_data=conf)()
+        with patch('socket.gethostbyname') as mock_resolve:
+            result = bridge.get_expected_tunnel_ip()
+            mock_resolve.assert_not_called()
+        self.assertEqual(result["raw_host"], "2001:db8::1")
+        self.assertEqual(result["resolved_ip"], "2001:db8::1")
+        self.assertFalse(result["is_hostname"])
+
+    @patch('os.path.exists', return_value=True)
+    @patch('builtins.open')
+    def test_get_expected_tunnel_ip_dns_failure_is_unverified(
+        self, mock_open, mock_exists
+    ):
+        # If the Endpoint hostname cannot be resolved, resolved_ip stays None;
+        # the state machine maps this to 'unverified', never to a false
+        # 'tunneled' claim.
+        conf = "[Interface]\n[Peer]\nEndpoint = ch1.tunnelsats.com:51820\n"
+        mock_open.return_value = unittest.mock.mock_open(read_data=conf)()
+        with patch('socket.gethostbyname', side_effect=Exception("NXDOMAIN")):
+            result = bridge.get_expected_tunnel_ip()
+        self.assertEqual(result["raw_host"], "ch1.tunnelsats.com")
+        self.assertEqual(result["resolved_ip"], None)
+        self.assertTrue(result["is_hostname"])
+
+    @patch('os.path.exists', return_value=True)
+    @patch('builtins.open')
+    def test_get_expected_tunnel_ip_unwraps_host_port(self, mock_open, mock_exists):
+        # A bare hostname+port Endpoint (no brackets) must drop the port.
+        conf = "[Interface]\n[Peer]\nEndpoint = ch1.tunnelsats.com:51820\n"
+        mock_open.return_value = unittest.mock.mock_open(read_data=conf)()
+        with patch('socket.gethostbyname', return_value="1.2.3.4"):
+            result = bridge.get_expected_tunnel_ip()
+        self.assertEqual(result["raw_host"], "ch1.tunnelsats.com")
+        self.assertEqual(result["resolved_ip"], "1.2.3.4")
+        self.assertTrue(result["is_hostname"])
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -7,6 +7,7 @@ import subprocess
 import signal
 import time
 import socket
+import ipaddress
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone
@@ -712,24 +713,33 @@ def get_expected_tunnel_ip():
         with open(CONFIG_PATH, "r") as f:
             content = f.read()
         match = re.search(
-            r"^\s*(?!#|;)\s*Endpoint\s*=\s*([^\s#:]+)", content,
+            r"^\s*(?!#|;)\s*Endpoint\s*=\s*(\S+)", content,
             re.IGNORECASE | re.MULTILINE,
         )
         if not match:
             return {"raw_host": None, "resolved_ip": None, "is_hostname": False}
         raw_host = match.group(1).strip()
-        # Prune any trailing ':' that may have been captured for bare hosts.
-        raw_host = raw_host.rstrip(":")
+        # Strip an optional port suffix (':51820') and unwrap a bracketed
+        # IPv6 literal ('[2001:db8::1]:51820' -> '2001:db8::1'), mirroring
+        # verify.sh. The package routes IPv4 only, but a malformed capture
+        # must never poison the comparison.
+        if raw_host.startswith("["):
+            end = raw_host.find("]")
+            if end != -1:
+                raw_host = raw_host[1:end]
+        else:
+            raw_host = raw_host.split(":", 1)[0]
         if not raw_host:
             return {"raw_host": None, "resolved_ip": None, "is_hostname": False}
         try:
-            socket.inet_aton(raw_host)
+            # A literal IP (v4 or v6) Endpoint needs no DNS resolution.
+            ipaddress.ip_address(raw_host)
             return {
                 "raw_host": raw_host,
                 "resolved_ip": raw_host,
                 "is_hostname": False,
             }
-        except OSError:
+        except ValueError:
             pass
         try:
             resolved = socket.gethostbyname(raw_host)
@@ -826,7 +836,12 @@ def get_egress_status(force=False):
 
 
 def egress_probe_loop():
-    """Background daemon: periodically refresh the egress probe."""
+    """Background daemon: periodically refresh the egress probe.
+
+    Runs one probe immediately on startup (so /api/status and the health
+    command have a result from t=0 rather than waiting a full interval),
+    then refreshes every _EGRESS_PROBE_INTERVAL seconds.
+    """
     while True:
         try:
             run_egress_probe()
