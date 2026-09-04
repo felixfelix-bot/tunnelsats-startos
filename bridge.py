@@ -372,6 +372,8 @@ class DashboardHTTPRequestHandler(BaseHTTPRequestHandler):
                 "vpn_ip": status_data.get("vpn_ip", "None"),
                 "internal_octet": status_data.get("internal_octet", "Unknown"),
                 "last_sync": status_data.get("last_sync"),
+                "egress": status_data.get("egress"),
+                "egress_tunneled": status_data.get("egress_tunneled", False),
             }
             self.wfile.write(json.dumps(response).encode("utf-8"))
             return
@@ -641,7 +643,10 @@ def get_status():
         status = "pending_sync"
         
     is_active = (enabled and has_config and sub_info["linked"] and not sub_info["isExpired"])
-        
+
+    egress_status = get_egress_status()
+    egress_state = egress_status.get("state", "unverified")
+
     return {
         "status": status,
         "enabled": enabled,
@@ -662,7 +667,176 @@ def get_status():
         "sync_error": sub_info.get("syncError"),
         "version": get_package_version(),
         "allow_ipv6": is_allow_ipv6(),
+        "egress": egress_status,
+        "egress_tunneled": egress_state == "tunneled",
     }
+
+
+# ---------------------------------------------------------------------------
+# Egress health check (fail-closed detection, not enforcement)
+#
+# The package pivoted to a host-managed gateway: outbound tunneling is a
+# manual opt-in (System > Gateways) and is fail-open by default. This change
+# promotes the manual egress probe from verify.sh (curl api.ipify.org vs the
+# parsed tunnel Endpoint) into a recurring health check so the gap stays
+# VISIBLE: an explicit 'outbound not tunneled' warning state is surfaced in
+# get_status()/api/status, the `bridge.py health egress` command, and the web
+# dashboard badge. Detection only — we never mutate routing.
+# ---------------------------------------------------------------------------
+
+_egress_probe_cache = None
+_EGRESS_PROBE_INTERVAL = 300  # seconds between background probes
+
+EGRESS_TUNNELED_MSG = "Outbound traffic is tunneled via TunnelSats."
+EGRESS_NOT_TUNNELED_MSG = (
+    "Outbound traffic is NOT tunneled via TunnelSats: the tunnel is "
+    "fail-open. Verify the host-managed gateway in System > Gateways."
+)
+EGRESS_UNVERIFIED_MSG = (
+    "Outbound egress could not be verified. Confirm the tunnel gateway is "
+    "active in System > Gateways."
+)
+
+
+def get_expected_tunnel_ip():
+    """Parse the tunnel server host from the WireGuard Endpoint in CONFIG_PATH.
+
+    Mirrors verify.sh: the Endpoint host (which may be a hostname like
+    'ch1.tunnelsats.com' or a literal IP) is the expected egress IP. A
+    hostname is resolved via DNS. Returns:
+        {"raw_host": str|None, "resolved_ip": str|None, "is_hostname": bool}
+    """
+    if not os.path.exists(CONFIG_PATH):
+        return {"raw_host": None, "resolved_ip": None, "is_hostname": False}
+    try:
+        with open(CONFIG_PATH, "r") as f:
+            content = f.read()
+        match = re.search(
+            r"^\s*(?!#|;)\s*Endpoint\s*=\s*([^\s#:]+)", content,
+            re.IGNORECASE | re.MULTILINE,
+        )
+        if not match:
+            return {"raw_host": None, "resolved_ip": None, "is_hostname": False}
+        raw_host = match.group(1).strip()
+        # Prune any trailing ':' that may have been captured for bare hosts.
+        raw_host = raw_host.rstrip(":")
+        if not raw_host:
+            return {"raw_host": None, "resolved_ip": None, "is_hostname": False}
+        try:
+            socket.inet_aton(raw_host)
+            return {
+                "raw_host": raw_host,
+                "resolved_ip": raw_host,
+                "is_hostname": False,
+            }
+        except OSError:
+            pass
+        try:
+            resolved = socket.gethostbyname(raw_host)
+            return {
+                "raw_host": raw_host,
+                "resolved_ip": resolved,
+                "is_hostname": True,
+            }
+        except Exception:
+            return {
+                "raw_host": raw_host,
+                "resolved_ip": None,
+                "is_hostname": True,
+            }
+    except Exception as e:
+        print(f"Error parsing expected tunnel IP: {e}", file=sys.stderr)
+        return {"raw_host": None, "resolved_ip": None, "is_hostname": False}
+
+
+def probe_egress_ip():
+    """Fetch the outbound public IPv4 via curl api.ipify.org (like verify.sh).
+
+    Honest live probe — never mocked in production. Returns the egress IPv4
+    string, or None if it cannot be determined.
+    """
+    try:
+        proc = subprocess.run(
+            ["curl", "-s", "--connect-timeout", "5", "--max-time", "10",
+             "https://api.ipify.org"],
+            capture_output=True,
+            text=True,
+            timeout=12,
+        )
+        if proc.returncode == 0:
+            candidate = proc.stdout.strip()
+            try:
+                socket.inet_aton(candidate)
+                return candidate
+            except OSError:
+                return None
+        return None
+    except Exception:
+        return None
+
+
+def compute_egress_state(actual_ip, expected_raw, expected_resolved):
+    """Classify outbound egress: 'tunneled' | 'not_tunneled' | 'unverified'."""
+    if not actual_ip:
+        return "unverified"
+    if expected_raw and actual_ip == expected_raw:
+        return "tunneled"
+    if expected_resolved and actual_ip == expected_resolved:
+        return "tunneled"
+    if not expected_raw and not expected_resolved:
+        return "unverified"
+    return "not_tunneled"
+
+
+def run_egress_probe():
+    """Perform a fresh egress probe and store the result in the cache."""
+    global _egress_probe_cache
+    expected = get_expected_tunnel_ip()
+    actual = probe_egress_ip()
+    state = compute_egress_state(actual, expected["raw_host"], expected["resolved_ip"])
+
+    if state == "tunneled":
+        message = EGRESS_TUNNELED_MSG
+    elif state == "not_tunneled":
+        message = EGRESS_NOT_TUNNELED_MSG
+    else:
+        message = EGRESS_UNVERIFIED_MSG
+
+    _egress_probe_cache = {
+        "state": state,
+        "actual_ip": actual,
+        "expected_ip": expected["raw_host"],
+        "is_hostname": expected["is_hostname"],
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "message": message,
+    }
+    return _egress_probe_cache
+
+
+def get_egress_status(force=False):
+    """Return cached egress status (never blocks on the network).
+
+    With force=True a fresh live probe is performed (used by the health
+    command / /api/status). Otherwise the last cached result is returned.
+    """
+    global _egress_probe_cache
+    if force or _egress_probe_cache is None:
+        return run_egress_probe()
+    return _egress_probe_cache
+
+
+def egress_probe_loop():
+    """Background daemon: periodically refresh the egress probe."""
+    while True:
+        try:
+            run_egress_probe()
+        except Exception as e:
+            print(f"Error in egress probe loop: {e}", file=sys.stderr)
+        try:
+            time.sleep(_EGRESS_PROBE_INTERVAL)
+        except KeyboardInterrupt:
+            break
+
 def validate_config(wg_conf):
     if not wg_conf:
         return
@@ -690,6 +864,9 @@ def main():
             sync_thread = threading.Thread(target=subscription_sync_loop, daemon=True)
             sync_thread.start()
 
+            egress_thread = threading.Thread(target=egress_probe_loop, daemon=True)
+            egress_thread.start()
+
             web_thread = threading.Thread(target=web_server_thread, daemon=True)
             web_thread.start()
 
@@ -711,7 +888,19 @@ def main():
         
     elif command == "health":
         target = sys.argv[2] if len(sys.argv) > 2 else "subscription"
-        
+
+        if target == "egress":
+            if not is_enabled():
+                print(json.dumps({"result": "disabled", "message": "TunnelSats is disabled."}))
+                sys.exit(0)
+            egress = get_egress_status(force=True)
+            state = egress.get("state", "unverified")
+            if state == "tunneled":
+                print(json.dumps({"result": "ok", "message": egress.get("message", EGRESS_TUNNELED_MSG)}))
+                sys.exit(0)
+            print(json.dumps({"result": "failure", "message": egress.get("message", EGRESS_UNVERIFIED_MSG)}))
+            sys.exit(1)
+
         if not is_enabled():
             print(json.dumps({"result": "disabled", "message": "TunnelSats is disabled."}))
             sys.exit(0)
