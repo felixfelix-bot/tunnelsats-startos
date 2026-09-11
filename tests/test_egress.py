@@ -278,5 +278,95 @@ class TestExpectedTunnelIp(unittest.TestCase):
         self.assertTrue(result["is_hostname"])
 
 
+class TestEgressColdReviewFixes(unittest.TestCase):
+    """Regressions for the two blocking findings of the cold cross-family
+    review of the final diff (2026-09-11):
+
+    1. A hostname Endpoint whose DNS lookup fails must classify as
+       'unverified' — never as a false 'not_tunneled' alarm.
+    2. get_egress_status() must never block on the network for a non-forced
+       read (the /api/status + dashboard path), even before the first
+       background probe has produced a result.
+    """
+
+    def setUp(self):
+        bridge._egress_probe_cache = None
+
+    def tearDown(self):
+        bridge._egress_probe_cache = None
+
+    def test_hostname_dns_failure_classifies_unverified(self):
+        # Endpoint = ch1.tunnelsats.com failed to resolve (resolved_ip=None):
+        # the outbound IP cannot be proven tunneled, but it also cannot be
+        # proven untunneled. Honest answer is 'unverified' (which the health
+        # command still treats as failure — fail-closed).
+        state = bridge.compute_egress_state(
+            "203.0.113.99", "ch1.tunnelsats.com", None
+        )
+        self.assertEqual(state, "unverified")
+
+    def test_literal_ip_mismatch_still_classifies_not_tunneled(self):
+        # A literal-IP Endpoint that does not match the observed egress is a
+        # confirmed mismatch -> explicit warning state (guards the fix against
+        # over-classifying every mismatch as 'unverified').
+        state = bridge.compute_egress_state(
+            "203.0.113.99", "198.51.100.10", "198.51.100.10"
+        )
+        self.assertEqual(state, "not_tunneled")
+
+    def test_non_forced_status_never_blocks_before_first_probe(self):
+        # The web/API read path must be non-blocking: with no cached result
+        # yet, it returns an honest 'unverified' placeholder instead of
+        # synchronously running curl (up to ~12s) on the request thread.
+        with patch('bridge.probe_egress_ip') as mock_probe, patch(
+            'bridge.get_expected_tunnel_ip'
+        ) as mock_expected:
+            status = bridge.get_egress_status()
+            mock_probe.assert_not_called()
+            mock_expected.assert_not_called()
+        self.assertEqual(status["state"], "unverified")
+        self.assertFalse(status["egress_tunneled"] if "egress_tunneled" in status
+                         else bridge.compute_egress_state(
+                             status.get("actual_ip"), None, None) == "tunneled")
+
+    def test_get_status_does_not_block_on_cold_cache(self):
+        with patch('bridge.is_enabled', return_value=True), patch(
+            'os.path.exists', return_value=True
+        ), patch('bridge.get_subscription_info') as mock_sub, patch(
+            'bridge.probe_egress_ip'
+        ) as mock_probe:
+            mock_sub.return_value = {
+                "linked": True,
+                "isExpired": False,
+                "expiresAt": "2026-12-31",
+                "daysRemaining": 100,
+                "formatted": "2026-12-31",
+                "lastSync": "2026-09-11T00:00:00Z",
+                "syncError": None,
+            }
+            status = bridge.get_status()
+            mock_probe.assert_not_called()
+        self.assertIn("egress", status)
+        self.assertEqual(status["egress"]["state"], "unverified")
+        self.assertFalse(status["egress_tunneled"])
+
+    @patch('os.path.exists', return_value=True)
+    @patch('builtins.open')
+    def test_bare_ipv6_literal_endpoint_is_not_mangled(
+        self, mock_open, mock_exists
+    ):
+        # An unbracketed IPv6 literal Endpoint contains ':' but has no port;
+        # naive colon-splitting would truncate it to '2001' and poison the
+        # comparison.
+        conf = "[Interface]\n[Peer]\nEndpoint = 2001:db8::1\n"
+        mock_open.return_value = unittest.mock.mock_open(read_data=conf)()
+        with patch('socket.gethostbyname') as mock_resolve:
+            result = bridge.get_expected_tunnel_ip()
+            mock_resolve.assert_not_called()
+        self.assertEqual(result["raw_host"], "2001:db8::1")
+        self.assertEqual(result["resolved_ip"], "2001:db8::1")
+        self.assertFalse(result["is_hostname"])
+
+
 if __name__ == '__main__':
     unittest.main()

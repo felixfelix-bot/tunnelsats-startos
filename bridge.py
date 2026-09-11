@@ -699,6 +699,17 @@ EGRESS_UNVERIFIED_MSG = (
 )
 
 
+def _is_literal_ip(value):
+    """True when value parses as an IPv4/IPv6 address literal (no DNS needed)."""
+    if not value:
+        return False
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
 def get_expected_tunnel_ip():
     """Parse the tunnel server host from the WireGuard Endpoint in CONFIG_PATH.
 
@@ -727,7 +738,10 @@ def get_expected_tunnel_ip():
             end = raw_host.find("]")
             if end != -1:
                 raw_host = raw_host[1:end]
-        else:
+        elif not _is_literal_ip(raw_host):
+            # 'host:port' / 'ipv4:port' -> drop the port. A bare IPv6 literal
+            # ('2001:db8::1') is a complete address and must NOT be
+            # colon-split, or it would be truncated to '2001'.
             raw_host = raw_host.split(":", 1)[0]
         if not raw_host:
             return {"raw_host": None, "resolved_ip": None, "is_hostname": False}
@@ -786,7 +800,13 @@ def probe_egress_ip():
 
 
 def compute_egress_state(actual_ip, expected_raw, expected_resolved):
-    """Classify outbound egress: 'tunneled' | 'not_tunneled' | 'unverified'."""
+    """Classify outbound egress: 'tunneled' | 'not_tunneled' | 'unverified'.
+
+    'unverified' is the honest indeterminate answer and is treated as FAILURE
+    by the health command (fail-closed): we report 'tunneled' only on a
+    confirmed match, and 'not_tunneled' only when the expected egress IP is
+    actually known.
+    """
     if not actual_ip:
         return "unverified"
     if expected_raw and actual_ip == expected_raw:
@@ -794,6 +814,11 @@ def compute_egress_state(actual_ip, expected_raw, expected_resolved):
     if expected_resolved and actual_ip == expected_resolved:
         return "tunneled"
     if not expected_raw and not expected_resolved:
+        return "unverified"
+    if expected_resolved is None and not _is_literal_ip(expected_raw):
+        # Endpoint was a hostname that could not be resolved: the tunnel's
+        # egress IP is unknown, so a mismatch proves nothing. Never raise a
+        # 'not tunneled' alarm we cannot substantiate.
         return "unverified"
     return "not_tunneled"
 
@@ -823,15 +848,33 @@ def run_egress_probe():
     return _egress_probe_cache
 
 
-def get_egress_status(force=False):
-    """Return cached egress status (never blocks on the network).
+def _pending_egress_status():
+    """Placeholder while the first background probe is still in flight."""
+    return {
+        "state": "unverified",
+        "actual_ip": None,
+        "expected_ip": None,
+        "is_hostname": False,
+        "checked_at": None,
+        "pending": True,
+        "message": EGRESS_UNVERIFIED_MSG,
+    }
 
-    With force=True a fresh live probe is performed (used by the health
-    command / /api/status). Otherwise the last cached result is returned.
+
+def get_egress_status(force=False):
+    """Return the egress status.
+
+    Non-forced reads — the /api/status and dashboard path — are guaranteed
+    NON-BLOCKING: they return the cached probe result, or a 'pending'
+    'unverified' placeholder while the background egress_probe_loop is still
+    working on the first probe. Only force=True (the `health egress` command)
+    runs a live probe synchronously.
     """
     global _egress_probe_cache
-    if force or _egress_probe_cache is None:
+    if force:
         return run_egress_probe()
+    if _egress_probe_cache is None:
+        return _pending_egress_status()
     return _egress_probe_cache
 
 
