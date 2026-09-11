@@ -794,8 +794,10 @@ def probe_egress_ip():
             # only, so the probe must test the IPv4 egress path. Without it a
             # dual-stack host can get an IPv6 answer that inet_aton rejects
             # and be misreported as 'unverified'.
-            ["curl", "-4", "-s", "--connect-timeout", "5", "--max-time", "10",
-             "https://api.ipify.org"],
+            # --fail: an HTTP 4xx/5xx (or captive-portal) body that happens to
+            # be an IPv4 literal must not be mistaken for the egress IP.
+            ["curl", "-4", "-s", "--fail", "--connect-timeout", "5",
+             "--max-time", "10", "https://api.ipify.org"],
             capture_output=True,
             text=True,
             timeout=12,

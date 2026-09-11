@@ -404,6 +404,9 @@ class TestEgressColdReviewFixes(unittest.TestCase):
         self.assertEqual(ip, "198.51.100.10")
         argv = mock_run.call_args[0][0]
         self.assertIn("-4", argv)
+        # --fail: without it an HTTP 4xx/5xx (or captive-portal) body that
+        # happens to be an IPv4 literal would be accepted as the egress IP.
+        self.assertIn("--fail", argv)
         self.assertIn("https://api.ipify.org", argv)
 
     def test_probe_rejects_non_ipv4_output(self):
