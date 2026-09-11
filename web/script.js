@@ -30,12 +30,14 @@ function updateUI() {
       // traffic is NOT tunneled (fail-open gap). Surfaced as a distinct state.
       badge.className = 'status-badge warning'
       badgeText.textContent = 'OUTBOUND NOT TUNNELED'
-    } else if (isRunning && egressState === 'unverified' && !egressPending) {
-      // The probe ran but could not verify the outbound path. That is not a
-      // healthy claim — `bridge.py health egress` fails closed on this state
-      // too — so the dashboard must not render the green active badge.
+    } else if (isRunning && egressState === 'unverified') {
+      // Unverified is never a healthy claim — `bridge.py health egress` fails
+      // closed on it — so neither the pending (first probe still running) nor
+      // the resolved-unverified case may render the green active badge.
       badge.className = 'status-badge warning'
-      badgeText.textContent = 'EGRESS UNVERIFIED'
+      badgeText.textContent = egressPending
+        ? 'CHECKING EGRESS'
+        : 'EGRESS UNVERIFIED'
     } else if (isRunning) {
       badge.className = 'status-badge active'
       badgeText.textContent = 'SUBSCRIPTION ACTIVE'
