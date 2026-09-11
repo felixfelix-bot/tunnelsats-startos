@@ -350,6 +350,25 @@ class TestEgressColdReviewFixes(unittest.TestCase):
         self.assertEqual(status["egress"]["state"], "unverified")
         self.assertFalse(status["egress_tunneled"])
 
+    def test_probe_forces_ipv4(self):
+        # api.ipify.org is dual-stack while this package routes IPv4 only: the
+        # probe must force IPv4, otherwise a dual-stack host can receive an
+        # IPv6 answer that socket.inet_aton rejects and be misreported as
+        # 'unverified' even when the IPv4 egress is correctly tunneled.
+        completed = unittest.mock.MagicMock(returncode=0, stdout="198.51.100.10")
+        with patch('bridge.subprocess.run', return_value=completed) as mock_run:
+            ip = bridge.probe_egress_ip()
+        self.assertEqual(ip, "198.51.100.10")
+        argv = mock_run.call_args[0][0]
+        self.assertIn("-4", argv)
+        self.assertIn("https://api.ipify.org", argv)
+
+    def test_probe_rejects_non_ipv4_output(self):
+        # Defensive: a non-IPv4 body must never be returned as an egress IP.
+        completed = unittest.mock.MagicMock(returncode=0, stdout="2001:db8::1\n")
+        with patch('bridge.subprocess.run', return_value=completed):
+            self.assertIsNone(bridge.probe_egress_ip())
+
     @patch('os.path.exists', return_value=True)
     @patch('builtins.open')
     def test_bare_ipv6_literal_endpoint_is_not_mangled(

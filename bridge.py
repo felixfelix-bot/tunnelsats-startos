@@ -8,6 +8,7 @@ import signal
 import time
 import socket
 import ipaddress
+import threading
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone
@@ -686,6 +687,7 @@ def get_status():
 # ---------------------------------------------------------------------------
 
 _egress_probe_cache = None
+_egress_probe_lock = threading.Lock()  # serializes probe writers
 _EGRESS_PROBE_INTERVAL = 300  # seconds between background probes
 
 EGRESS_TUNNELED_MSG = "Outbound traffic is tunneled via TunnelSats."
@@ -777,11 +779,16 @@ def probe_egress_ip():
     """Fetch the outbound public IPv4 via curl api.ipify.org (like verify.sh).
 
     Honest live probe — never mocked in production. Returns the egress IPv4
-    string, or None if it cannot be determined.
+    string, or None if it cannot be determined (curl failure, or a body that
+    is not an IPv4 literal).
     """
     try:
         proc = subprocess.run(
-            ["curl", "-s", "--connect-timeout", "5", "--max-time", "10",
+            # -4: api.ipify.org is dual-stack but this package routes IPv4
+            # only, so the probe must test the IPv4 egress path. Without it a
+            # dual-stack host can get an IPv6 answer that inet_aton rejects
+            # and be misreported as 'unverified'.
+            ["curl", "-4", "-s", "--connect-timeout", "5", "--max-time", "10",
              "https://api.ipify.org"],
             capture_output=True,
             text=True,
@@ -824,28 +831,35 @@ def compute_egress_state(actual_ip, expected_raw, expected_resolved):
 
 
 def run_egress_probe():
-    """Perform a fresh egress probe and store the result in the cache."""
+    """Perform a fresh egress probe and store the result in the cache.
+
+    Writers are serialized by _egress_probe_lock so a forced (health command)
+    probe and the background loop cannot race on the shared global. Readers
+    deliberately take no lock — a plain reference read cannot tear — so a
+    status read is never delayed by an in-flight probe.
+    """
     global _egress_probe_cache
-    expected = get_expected_tunnel_ip()
-    actual = probe_egress_ip()
-    state = compute_egress_state(actual, expected["raw_host"], expected["resolved_ip"])
+    with _egress_probe_lock:
+        expected = get_expected_tunnel_ip()
+        actual = probe_egress_ip()
+        state = compute_egress_state(actual, expected["raw_host"], expected["resolved_ip"])
 
-    if state == "tunneled":
-        message = EGRESS_TUNNELED_MSG
-    elif state == "not_tunneled":
-        message = EGRESS_NOT_TUNNELED_MSG
-    else:
-        message = EGRESS_UNVERIFIED_MSG
+        if state == "tunneled":
+            message = EGRESS_TUNNELED_MSG
+        elif state == "not_tunneled":
+            message = EGRESS_NOT_TUNNELED_MSG
+        else:
+            message = EGRESS_UNVERIFIED_MSG
 
-    _egress_probe_cache = {
-        "state": state,
-        "actual_ip": actual,
-        "expected_ip": expected["raw_host"],
-        "is_hostname": expected["is_hostname"],
-        "checked_at": datetime.now(timezone.utc).isoformat(),
-        "message": message,
-    }
-    return _egress_probe_cache
+        _egress_probe_cache = {
+            "state": state,
+            "actual_ip": actual,
+            "expected_ip": expected["raw_host"],
+            "is_hostname": expected["is_hostname"],
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+            "message": message,
+        }
+        return _egress_probe_cache
 
 
 def _pending_egress_status():
@@ -918,7 +932,6 @@ def main():
         signal.signal(signal.SIGTERM, shutdown_handler)
         signal.signal(signal.SIGINT, shutdown_handler)
         try:
-            import threading
             sync_thread = threading.Thread(target=subscription_sync_loop, daemon=True)
             sync_thread.start()
 
