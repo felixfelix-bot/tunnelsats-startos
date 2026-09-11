@@ -85,7 +85,8 @@ function updateUI() {
   const egressState = statusData.egress ? statusData.egress.state : 'unverified'
   const egressBanner = document.getElementById('egress-warning-banner')
   if (egressBanner) {
-    egressBanner.style.display = egressState === 'not_tunneled' ? 'block' : 'none'
+    egressBanner.style.display =
+      statusData.enabled && egressState === 'not_tunneled' ? 'block' : 'none'
   }
 
   // 3. Highlighted guide config parameters

@@ -758,6 +758,9 @@ def get_expected_tunnel_ip():
         except ValueError:
             pass
         try:
+            # IPv4-only resolution by design (this package routes IPv4 only).
+            # An IPv6-only Endpoint hostname resolves to None and is reported
+            # as 'unverified' rather than guessed at.
             resolved = socket.gethostbyname(raw_host)
             return {
                 "raw_host": raw_host,
@@ -884,12 +887,12 @@ def get_egress_status(force=False):
     working on the first probe. Only force=True (the `health egress` command)
     runs a live probe synchronously.
     """
-    global _egress_probe_cache
     if force:
         return run_egress_probe()
-    if _egress_probe_cache is None:
+    cache = _egress_probe_cache  # single atomic reference read
+    if cache is None:
         return _pending_egress_status()
-    return _egress_probe_cache
+    return cache
 
 
 def egress_probe_loop():
