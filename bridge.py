@@ -738,8 +738,11 @@ def get_expected_tunnel_ip():
         # must never poison the comparison.
         if raw_host.startswith("["):
             end = raw_host.find("]")
-            if end != -1:
-                raw_host = raw_host[1:end]
+            if end == -1:
+                # Malformed bracketed endpoint ('[abc'): never slice it into a
+                # garbled host, just report 'unverified'.
+                return {"raw_host": None, "resolved_ip": None, "is_hostname": False}
+            raw_host = raw_host[1:end]
         elif not _is_literal_ip(raw_host):
             # 'host:port' / 'ipv4:port' -> drop the port. A bare IPv6 literal
             # ('2001:db8::1') is a complete address and must NOT be

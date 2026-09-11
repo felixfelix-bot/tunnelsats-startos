@@ -350,6 +350,49 @@ class TestEgressColdReviewFixes(unittest.TestCase):
         self.assertEqual(status["egress"]["state"], "unverified")
         self.assertFalse(status["egress_tunneled"])
 
+    @patch('bridge.is_enabled', return_value=True)
+    @patch('os.path.exists', return_value=True)
+    @patch('bridge.run_egress_probe')
+    @patch('sys.stdout', new_callable=io.StringIO)
+    def test_health_egress_unverified_fails_closed(
+        self, mock_stdout, mock_run, mock_exists, mock_enabled
+    ):
+        # Pins the central fail-closed claim: an indeterminate probe result
+        # must be a failure, never a silent 'ok'.
+        mock_run.return_value = {
+            "state": "unverified",
+            "actual_ip": None,
+            "expected_ip": "ch1.tunnelsats.com",
+            "checked_at": "2026-09-11T12:00:00Z",
+            "message": bridge.EGRESS_UNVERIFIED_MSG,
+        }
+        with patch('sys.argv', ['bridge.py', 'health', 'egress']):
+            with self.assertRaises(SystemExit) as cm:
+                bridge.main()
+            self.assertEqual(cm.exception.code, 1)
+        output = json.loads(mock_stdout.getvalue())
+        self.assertEqual(output["result"], "failure")
+
+    @patch('os.path.exists', return_value=True)
+    @patch('builtins.open')
+    def test_malformed_bracketed_endpoint_is_unverified(
+        self, mock_open, mock_exists
+    ):
+        # A truncated bracket ('[abc') must never be sliced into a garbled
+        # host that could be compared against the real egress IP.
+        conf = "[Interface]\n[Peer]\nEndpoint = [abc\n"
+        mock_open.return_value = unittest.mock.mock_open(read_data=conf)()
+        with patch('socket.gethostbyname') as mock_resolve:
+            result = bridge.get_expected_tunnel_ip()
+            mock_resolve.assert_not_called()
+        self.assertIsNone(result["raw_host"])
+        self.assertIsNone(result["resolved_ip"])
+        self.assertEqual(
+            bridge.compute_egress_state("203.0.113.9", result["raw_host"],
+                                        result["resolved_ip"]),
+            "unverified",
+        )
+
     def test_probe_forces_ipv4(self):
         # api.ipify.org is dual-stack while this package routes IPv4 only: the
         # probe must force IPv4, otherwise a dual-stack host can receive an
