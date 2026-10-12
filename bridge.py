@@ -7,6 +7,8 @@ import subprocess
 import signal
 import time
 import socket
+import ipaddress
+import threading
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone
@@ -372,6 +374,8 @@ class DashboardHTTPRequestHandler(BaseHTTPRequestHandler):
                 "vpn_ip": status_data.get("vpn_ip", "None"),
                 "internal_octet": status_data.get("internal_octet", "Unknown"),
                 "last_sync": status_data.get("last_sync"),
+                "egress": status_data.get("egress"),
+                "egress_tunneled": status_data.get("egress_tunneled", False),
             }
             self.wfile.write(json.dumps(response).encode("utf-8"))
             return
@@ -641,7 +645,10 @@ def get_status():
         status = "pending_sync"
         
     is_active = (enabled and has_config and sub_info["linked"] and not sub_info["isExpired"])
-        
+
+    egress_status = get_egress_status()
+    egress_state = egress_status.get("state", "unverified")
+
     return {
         "status": status,
         "enabled": enabled,
@@ -662,7 +669,254 @@ def get_status():
         "sync_error": sub_info.get("syncError"),
         "version": get_package_version(),
         "allow_ipv6": is_allow_ipv6(),
+        "egress": egress_status,
+        "egress_tunneled": egress_state == "tunneled",
     }
+
+
+# ---------------------------------------------------------------------------
+# Egress health check (fail-closed detection, not enforcement)
+#
+# The package pivoted to a host-managed gateway: outbound tunneling is a
+# manual opt-in (System > Gateways) and is fail-open by default. This change
+# promotes the manual egress probe from verify.sh (curl api.ipify.org vs the
+# parsed tunnel Endpoint) into a recurring health check so the gap stays
+# VISIBLE: an explicit 'outbound not tunneled' warning state is surfaced in
+# get_status()/api/status, the `bridge.py health egress` command, and the web
+# dashboard badge. Detection only — we never mutate routing.
+# ---------------------------------------------------------------------------
+
+_egress_probe_cache = None
+_egress_probe_lock = threading.Lock()  # serializes probe writers
+_EGRESS_PROBE_INTERVAL = 300  # seconds between background probes
+
+EGRESS_TUNNELED_MSG = "Outbound traffic is tunneled via TunnelSats."
+EGRESS_NOT_TUNNELED_MSG = (
+    "Outbound traffic is NOT tunneled via TunnelSats: the tunnel is "
+    "fail-open. Verify the host-managed gateway in System > Gateways."
+)
+EGRESS_UNVERIFIED_MSG = (
+    "Outbound egress could not be verified. Confirm the tunnel gateway is "
+    "active in System > Gateways."
+)
+
+
+def _is_literal_ip(value):
+    """True when value parses as an IPv4/IPv6 address literal (no DNS needed)."""
+    if not value:
+        return False
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
+def get_expected_tunnel_ip():
+    """Parse the tunnel server host from the WireGuard Endpoint in CONFIG_PATH.
+
+    Mirrors verify.sh: the Endpoint host (which may be a hostname like
+    'ch1.tunnelsats.com' or a literal IP) is the expected egress IP. A
+    hostname is resolved via DNS. Returns:
+        {"raw_host": str|None, "resolved_ip": str|None, "is_hostname": bool}
+    """
+    if not os.path.exists(CONFIG_PATH):
+        return {"raw_host": None, "resolved_ip": None, "is_hostname": False}
+    try:
+        with open(CONFIG_PATH, "r") as f:
+            content = f.read()
+        match = re.search(
+            r"^\s*(?!#|;)\s*Endpoint\s*=\s*(\S+)", content,
+            re.IGNORECASE | re.MULTILINE,
+        )
+        if not match:
+            return {"raw_host": None, "resolved_ip": None, "is_hostname": False}
+        raw_host = match.group(1).strip()
+        # Strip an optional port suffix (':51820') and unwrap a bracketed
+        # IPv6 literal ('[2001:db8::1]:51820' -> '2001:db8::1'), mirroring
+        # verify.sh. The package routes IPv4 only, but a malformed capture
+        # must never poison the comparison.
+        if raw_host.startswith("["):
+            end = raw_host.find("]")
+            if end == -1:
+                # Malformed bracketed endpoint ('[abc'): never slice it into a
+                # garbled host, just report 'unverified'.
+                return {"raw_host": None, "resolved_ip": None, "is_hostname": False}
+            raw_host = raw_host[1:end]
+        elif not _is_literal_ip(raw_host):
+            # 'host:port' / 'ipv4:port' -> drop the port. A bare IPv6 literal
+            # ('2001:db8::1') is a complete address and must NOT be
+            # colon-split, or it would be truncated to '2001'.
+            raw_host = raw_host.split(":", 1)[0]
+        if not raw_host:
+            return {"raw_host": None, "resolved_ip": None, "is_hostname": False}
+        try:
+            # A literal IP (v4 or v6) Endpoint needs no DNS resolution.
+            ipaddress.ip_address(raw_host)
+            return {
+                "raw_host": raw_host,
+                "resolved_ip": raw_host,
+                "is_hostname": False,
+            }
+        except ValueError:
+            pass
+        try:
+            # IPv4-only resolution by design (this package routes IPv4 only).
+            # An IPv6-only Endpoint hostname resolves to None and is reported
+            # as 'unverified' rather than guessed at.
+            resolved = socket.gethostbyname(raw_host)
+            return {
+                "raw_host": raw_host,
+                "resolved_ip": resolved,
+                "is_hostname": True,
+            }
+        except Exception:
+            return {
+                "raw_host": raw_host,
+                "resolved_ip": None,
+                "is_hostname": True,
+            }
+    except Exception as e:
+        print(f"Error parsing expected tunnel IP: {e}", file=sys.stderr)
+        return {"raw_host": None, "resolved_ip": None, "is_hostname": False}
+
+
+def probe_egress_ip():
+    """Fetch the outbound public IPv4 via curl api.ipify.org (like verify.sh).
+
+    Honest live probe — never mocked in production. Returns the egress IPv4
+    string, or None if it cannot be determined (curl failure, or a body that
+    is not an IPv4 literal).
+    """
+    try:
+        proc = subprocess.run(
+            # -4: api.ipify.org is dual-stack but this package routes IPv4
+            # only, so the probe must test the IPv4 egress path. Without it a
+            # dual-stack host can get an IPv6 answer that inet_aton rejects
+            # and be misreported as 'unverified'.
+            # --fail: an HTTP 4xx/5xx (or captive-portal) body that happens to
+            # be an IPv4 literal must not be mistaken for the egress IP.
+            ["curl", "-4", "-s", "--fail", "--connect-timeout", "5",
+             "--max-time", "10", "https://api.ipify.org"],
+            capture_output=True,
+            text=True,
+            timeout=12,
+        )
+        if proc.returncode == 0:
+            candidate = proc.stdout.strip()
+            try:
+                socket.inet_aton(candidate)
+                return candidate
+            except OSError:
+                return None
+        return None
+    except Exception:
+        return None
+
+
+def compute_egress_state(actual_ip, expected_raw, expected_resolved):
+    """Classify outbound egress: 'tunneled' | 'not_tunneled' | 'unverified'.
+
+    'unverified' is the honest indeterminate answer and is treated as FAILURE
+    by the health command (fail-closed): we report 'tunneled' only on a
+    confirmed match, and 'not_tunneled' only when the expected egress IP is
+    actually known.
+    """
+    if not actual_ip:
+        return "unverified"
+    if expected_raw and actual_ip == expected_raw:
+        return "tunneled"
+    if expected_resolved and actual_ip == expected_resolved:
+        return "tunneled"
+    if not expected_raw and not expected_resolved:
+        return "unverified"
+    if expected_resolved is None and not _is_literal_ip(expected_raw):
+        # Endpoint was a hostname that could not be resolved: the tunnel's
+        # egress IP is unknown, so a mismatch proves nothing. Never raise a
+        # 'not tunneled' alarm we cannot substantiate.
+        return "unverified"
+    return "not_tunneled"
+
+
+def run_egress_probe():
+    """Perform a fresh egress probe and store the result in the cache.
+
+    Writers are serialized by _egress_probe_lock so a forced (health command)
+    probe and the background loop cannot race on the shared global. Readers
+    deliberately take no lock — a plain reference read cannot tear — so a
+    status read is never delayed by an in-flight probe.
+    """
+    global _egress_probe_cache
+    with _egress_probe_lock:
+        expected = get_expected_tunnel_ip()
+        actual = probe_egress_ip()
+        state = compute_egress_state(actual, expected["raw_host"], expected["resolved_ip"])
+
+        if state == "tunneled":
+            message = EGRESS_TUNNELED_MSG
+        elif state == "not_tunneled":
+            message = EGRESS_NOT_TUNNELED_MSG
+        else:
+            message = EGRESS_UNVERIFIED_MSG
+
+        _egress_probe_cache = {
+            "state": state,
+            "actual_ip": actual,
+            "expected_ip": expected["raw_host"],
+            "is_hostname": expected["is_hostname"],
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+            "message": message,
+        }
+        return _egress_probe_cache
+
+
+def _pending_egress_status():
+    """Placeholder while the first background probe is still in flight."""
+    return {
+        "state": "unverified",
+        "actual_ip": None,
+        "expected_ip": None,
+        "is_hostname": False,
+        "checked_at": None,
+        "pending": True,
+        "message": EGRESS_UNVERIFIED_MSG,
+    }
+
+
+def get_egress_status(force=False):
+    """Return the egress status.
+
+    Non-forced reads — the /api/status and dashboard path — are guaranteed
+    NON-BLOCKING: they return the cached probe result, or a 'pending'
+    'unverified' placeholder while the background egress_probe_loop is still
+    working on the first probe. Only force=True (the `health egress` command)
+    runs a live probe synchronously.
+    """
+    if force:
+        return run_egress_probe()
+    cache = _egress_probe_cache  # single atomic reference read
+    if cache is None:
+        return _pending_egress_status()
+    return cache
+
+
+def egress_probe_loop():
+    """Background daemon: periodically refresh the egress probe.
+
+    Runs one probe immediately on startup (so /api/status and the health
+    command have a result from t=0 rather than waiting a full interval),
+    then refreshes every _EGRESS_PROBE_INTERVAL seconds.
+    """
+    while True:
+        try:
+            run_egress_probe()
+        except Exception as e:
+            print(f"Error in egress probe loop: {e}", file=sys.stderr)
+        try:
+            time.sleep(_EGRESS_PROBE_INTERVAL)
+        except KeyboardInterrupt:
+            break
+
 def validate_config(wg_conf):
     if not wg_conf:
         return
@@ -686,9 +940,11 @@ def main():
         signal.signal(signal.SIGTERM, shutdown_handler)
         signal.signal(signal.SIGINT, shutdown_handler)
         try:
-            import threading
             sync_thread = threading.Thread(target=subscription_sync_loop, daemon=True)
             sync_thread.start()
+
+            egress_thread = threading.Thread(target=egress_probe_loop, daemon=True)
+            egress_thread.start()
 
             web_thread = threading.Thread(target=web_server_thread, daemon=True)
             web_thread.start()
@@ -711,7 +967,19 @@ def main():
         
     elif command == "health":
         target = sys.argv[2] if len(sys.argv) > 2 else "subscription"
-        
+
+        if target == "egress":
+            if not is_enabled():
+                print(json.dumps({"result": "disabled", "message": "TunnelSats is disabled."}))
+                sys.exit(0)
+            egress = get_egress_status(force=True)
+            state = egress.get("state", "unverified")
+            if state == "tunneled":
+                print(json.dumps({"result": "ok", "message": egress.get("message", EGRESS_TUNNELED_MSG)}))
+                sys.exit(0)
+            print(json.dumps({"result": "failure", "message": egress.get("message", EGRESS_UNVERIFIED_MSG)}))
+            sys.exit(1)
+
         if not is_enabled():
             print(json.dumps({"result": "disabled", "message": "TunnelSats is disabled."}))
             sys.exit(0)

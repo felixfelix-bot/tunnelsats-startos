@@ -20,7 +20,25 @@ function updateUI() {
   const badgeText = badge.querySelector('.status-text')
 
   if (statusData.enabled) {
-    if (statusData.status === 'running' || (statusData.vpn_connected && statusData.handshake === 'active')) {
+    const egressState = statusData.egress ? statusData.egress.state : 'unverified'
+    const isRunning =
+      statusData.status === 'running' ||
+      (statusData.vpn_connected && statusData.handshake === 'active')
+    const egressPending = !!(statusData.egress && statusData.egress.pending)
+    if (isRunning && egressState === 'not_tunneled') {
+      // Explicit warning: tunnel is up/subscription active, but outbound
+      // traffic is NOT tunneled (fail-open gap). Surfaced as a distinct state.
+      badge.className = 'status-badge warning'
+      badgeText.textContent = 'OUTBOUND NOT TUNNELED'
+    } else if (isRunning && egressState === 'unverified') {
+      // Unverified is never a healthy claim — `bridge.py health egress` fails
+      // closed on it — so neither the pending (first probe still running) nor
+      // the resolved-unverified case may render the green active badge.
+      badge.className = 'status-badge warning'
+      badgeText.textContent = egressPending
+        ? 'CHECKING EGRESS'
+        : 'EGRESS UNVERIFIED'
+    } else if (isRunning) {
       badge.className = 'status-badge active'
       badgeText.textContent = 'SUBSCRIPTION ACTIVE'
     } else if (statusData.status === 'expired') {
@@ -61,6 +79,14 @@ function updateUI() {
   const ipv6Banner = document.getElementById('ipv6-warning-banner')
   if (ipv6Banner) {
     ipv6Banner.style.display = statusData.allow_ipv6 ? 'block' : 'none'
+  }
+
+  // Outbound egress warning banner: shown when outbound is NOT tunneled
+  const egressState = statusData.egress ? statusData.egress.state : 'unverified'
+  const egressBanner = document.getElementById('egress-warning-banner')
+  if (egressBanner) {
+    egressBanner.style.display =
+      statusData.enabled && egressState === 'not_tunneled' ? 'block' : 'none'
   }
 
   // 3. Highlighted guide config parameters
